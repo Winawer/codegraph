@@ -1106,9 +1106,12 @@ export class ReferenceResolver {
       ref.language === 'arkts' && ref.referenceName.startsWith('.')
         ? ref.referenceName.slice(1)
         : ref.referenceName;
-    // Erlang refs carry the call-site arity (`f/1`, `mod::f/2` — #1610); the
-    // name index stores bare names, so existence is checked arity-less.
-    if (ref.language === 'erlang') existenceName = existenceName.replace(/\/\d{1,3}$/, '');
+    // Erlang and Elixir refs carry the call-site arity (`f/1`, `mod::f/2` —
+    // #1610); the name index stores bare names, so existence is checked
+    // arity-less.
+    if (ref.language === 'erlang' || ref.language === 'elixir') {
+      existenceName = existenceName.replace(/\/\d{1,3}$/, '');
+    }
     const tPre = this.profileStages ? process.hrtime.bigint() : 0n;
     const preFilterPass =
       isNixPathImportRef(ref) ||

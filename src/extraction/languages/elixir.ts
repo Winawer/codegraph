@@ -77,16 +77,26 @@ const DEF_MACROS = new Set([...PUBLIC_DEFS, ...PRIVATE_DEFS]);
 
 /**
  * Per-file clause-merge state. Elixir emits one `def` call PER CLAUSE (pattern
- * matching / default args / guards), so consecutive same-name definitions in
- * the same module are merged into a single function node — the endLine is
- * extended and the extra clause's body attributed to the existing node. Keyed
- * by (file, module node id, name): a same-named function in a different module
- * must NOT merge. Extraction is file-sequential, so a single-entry memo is safe.
+ * matching / default args / guards), so consecutive same-name same-ARITY
+ * definitions in the same module are merged into a single function node — the
+ * endLine is extended and the extra clause's body attributed to the existing
+ * node. Keyed by (file, module node id, name, arity): a same-named function in
+ * a different module must NOT merge, and arity is part of a function's identity
+ * (`get/1` and `get/2` are unrelated definitions — the Erlang model, #1610).
+ * Extraction is file-sequential, so a single-entry memo is safe.
  */
 let lastFnFile = '';
 let lastFnModuleId = '';
 let lastFnName = '';
+let lastFnArity = -1;
 let lastFnId = '';
+
+/**
+ * Marker a default-argument definition carries in `decorators` — the only
+ * persisted per-node slot — recording the lowest arity it accepts. The
+ * resolver reads it back so `get(id)` can land on `def get(id, opts \\ [])`.
+ */
+export const ELIXIR_MIN_ARITY_PREFIX = 'elixir:min-arity=';
 
 /** Nesting stack of enclosing module full dotted names (for nested defmodule). */
 let moduleNameStack: string[] = [];
@@ -232,6 +242,28 @@ function defName(node: SyntaxNode, source: string): { name: string; head: Syntax
     if (left?.type === 'identifier') return { name: getNodeText(left, source), head: null };
   }
   return null;
+}
+
+/**
+ * True for a `binary_operator` whose operator token is `op`. Read from the
+ * `operator` field, not the text between the operands: a comment can sit there
+ * (`fragment(conn)\n  # note\n  |> omit(...)`).
+ */
+export function isElixirOperator(node: SyntaxNode | null, op: string, source: string): boolean {
+  if (node?.type !== 'binary_operator') return false;
+  const operator = getChildByField(node, 'operator');
+  return !!operator && getNodeText(operator, source) === op;
+}
+
+/**
+ * Arity range of a def head: `arity` counts every parameter, `minArity`
+ * excludes those with a default (`opts \\ []`). A bare-identifier head
+ * (`def hello, do: …`) is arity 0.
+ */
+function defArity(head: SyntaxNode | null, source: string): { arity: number; minArity: number } {
+  const params = head ? (argsOf(head)?.namedChildren ?? []).filter((c) => c.type !== 'comment') : [];
+  const defaults = params.filter((p) => isElixirOperator(p, '\\\\', source)).length;
+  return { arity: params.length, minArity: params.length - defaults };
 }
 
 /**
@@ -382,12 +414,15 @@ function handleDef(node: SyntaxNode, ctx: ExtractorContext, macro: string): bool
   const { name, head } = named;
   const moduleId = ctx.nodeStack[ctx.nodeStack.length - 1] ?? '';
   const fullMod = currentModulePrefix();
+  const { arity, minArity } = defArity(head, ctx.source);
 
-  // Continuation clause of the same function in the same module — merge.
+  // Continuation clause of the same function (same name AND arity) in the same
+  // module — merge.
   if (
     ctx.filePath === lastFnFile &&
     moduleId === lastFnModuleId &&
     name === lastFnName &&
+    arity === lastFnArity &&
     lastFnId
   ) {
     for (let i = ctx.nodes.length - 1; i >= 0; i--) {
@@ -406,12 +441,16 @@ function handleDef(node: SyntaxNode, ctx: ExtractorContext, macro: string): bool
   const attrs = precedingAttrs(node, ctx.source);
   const signature =
     attrs.signature ?? (head ? collapseWs(getNodeText(head, ctx.source)).slice(0, 300) : name);
+  // Arity is part of the function's identity — carry it on the qualified name
+  // (`Mod::fun/2`, as Erlang does). The node NAME stays bare so name search and
+  // `Mod.fun` lookups still find every arity.
   const fn = ctx.createNode('function', name, node, {
-    qualifiedName: fullMod ? `${fullMod}::${name}` : name,
+    qualifiedName: fullMod ? `${fullMod}::${name}/${arity}` : `${name}/${arity}`,
     signature,
     docstring: attrs.docstring,
     isExported: PUBLIC_DEFS.has(macro),
     visibility: PRIVATE_DEFS.has(macro) ? 'private' : 'public',
+    decorators: minArity < arity ? [`${ELIXIR_MIN_ARITY_PREFIX}${minArity}`] : undefined,
   });
   if (!fn) return true;
   ctx.pushScope(fn.id);
@@ -420,6 +459,7 @@ function handleDef(node: SyntaxNode, ctx: ExtractorContext, macro: string): bool
   lastFnFile = ctx.filePath;
   lastFnModuleId = moduleId;
   lastFnName = name;
+  lastFnArity = arity;
   lastFnId = fn.id;
   return true;
 }

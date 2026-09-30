@@ -3073,6 +3073,18 @@ export class ExtractionOrchestrator {
     const reinserted: Edge[] = [];
     const resurrected: UnresolvedReference[] = [];
     for (const e of crossFileIncomingEdges) {
+      // An Elixir function's identity is name AND arity, and which arity a
+      // call binds to depends on the callee's default arguments — so (kind,
+      // name) can re-attach `get/1`'s caller to `get/2`, or keep an edge whose
+      // default was just removed. Re-resolve those edges from their original
+      // ref instead (the #1240 resurrection path).
+      if (e.sourceLanguage === 'elixir' && e.targetKind === 'function') {
+        const ref = resurrectRefFromDroppedEdge(e);
+        if (ref) {
+          resurrected.push(ref);
+          continue;
+        }
+      }
       const newTargetId = newNodesByKindName.get(`${e.targetKind}\0${e.targetName}`);
       if (newTargetId) {
         reinserted.push({ source: e.source, target: newTargetId, kind: e.kind, metadata: e.metadata, line: e.line, column: e.column, provenance: e.provenance });

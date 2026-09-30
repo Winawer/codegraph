@@ -11,6 +11,7 @@ import { UnresolvedRef, ResolvedRef, ResolutionContext, isSupertypeTarget, CPP_D
 import { blankStringContents, stripCommentsForRegex } from './strip-comments';
 import { JS_BUILT_INS, JS_BUILTIN_METHODS, TS_PRIMITIVE_TYPES } from './js-builtins';
 import { SWIFT_TYPE_PATH_CALL, resolveSwiftTypePathCall } from './swift-type-visibility';
+import { ELIXIR_MIN_ARITY_PREFIX } from '../extraction/languages/elixir';
 /**
  * Ceiling on how many same-named definitions a FUZZY name-match strategy will
  * score. A name defined more times than this is "ubiquitous" — a method/symbol
@@ -3218,6 +3219,40 @@ export function matchByQualifiedName(
         resolvedBy: 'qualified-name',
       };
     }
+  }
+
+  // Elixir qualified refs (`Mod::fun/2`) that missed the exact lookup: the
+  // only legitimate target left is a default-argument definition in that
+  // module whose range covers the call. Never fall through to the partial
+  // match below — its "last segment" would be the arity digits — and never
+  // settle for a sibling arity.
+  //
+  // A module the file never spells out in full — an outer module's `alias`
+  // (which nested modules inherit) or one a `use` injects — leaves only the
+  // alias's trailing segments at the call site (`Changeset::cast/3` for
+  // `Lib.Changeset`). When exactly one module's name ends in those segments,
+  // it is the target; two or more is a guess, so none.
+  if (ref.language === 'elixir' && ref.referenceName.includes('::')) {
+    const am = /^(.+)::([^:]+)\/(\d{1,3})$/.exec(ref.referenceName);
+    if (!am) return null;
+    const [, mod, fn, arity] = am as unknown as [string, string, string, string];
+    const byModule = new Map<string, Node[]>();
+    for (const n of keepForRef(context.getNodesByName(fn))) {
+      if (n.language !== 'elixir' || n.kind !== 'function') continue;
+      const nodeModule = elixirModuleOf(n);
+      if (nodeModule !== mod && !nodeModule?.endsWith(`.${mod}`)) continue;
+      byModule.set(nodeModule, [...(byModule.get(nodeModule) ?? []), n]);
+    }
+    const exactModule = byModule.get(mod);
+    const scoped = exactModule ? [exactModule] : [...byModule.values()];
+    const picks = scoped.map((defs) => pickElixirArity(defs, Number(arity))).filter((n) => n !== undefined);
+    if (picks.length !== 1) return null;
+    return {
+      original: ref,
+      targetNodeId: picks[0]!.id,
+      confidence: exactModule ? 0.9 : 0.8,
+      resolvedBy: 'qualified-name',
+    };
   }
 
   // Erlang qualified refs (#1610): every erlang function's qualifiedName
@@ -6486,6 +6521,25 @@ function elixirModuleOf(node: Node | null | undefined): string | null {
   return sep > 0 ? node.qualifiedName.slice(0, sep) : null;
 }
 
+/**
+ * The Elixir definition a call of `arity` lands on: the definition of exactly
+ * that arity (every Elixir function's qualifiedName ends `/N`), else one whose
+ * default arguments (`def get(id, opts \\ [])`, min arity recorded in
+ * `decorators`) accept it. Anything else — a sibling arity with no default
+ * covering the call — is a wrong edge, so there is no fallback.
+ */
+function pickElixirArity(candidates: Node[], arity: number): Node | undefined {
+  const exact = candidates.find((n) => n.qualifiedName.endsWith(`/${arity}`));
+  if (exact) return exact;
+  return candidates.find((n) => {
+    const max = /\/(\d{1,3})$/.exec(n.qualifiedName)?.[1];
+    const marker = n.decorators?.find((d) => d.startsWith(ELIXIR_MIN_ARITY_PREFIX));
+    if (max === undefined || !marker) return false;
+    const min = Number(marker.slice(ELIXIR_MIN_ARITY_PREFIX.length));
+    return arity >= min && arity < Number(max);
+  });
+}
+
 export function matchReference(
   ref: UnresolvedRef,
   context: ResolutionContext
@@ -6570,10 +6624,14 @@ function matchReferenceInner(
     // calls in module-attribute values (c4c0eec), IS the module) and keep only
     // candidates in that module. Caller module indeterminable, or no same-module
     // candidate → stay unresolved.
+    // The ref carries the call-site arity (`helper/2`); pick that arity, or a
+    // default-argument definition covering it, never a sibling arity.
     const callerModule = elixirModuleOf(context.getNodeById?.(ref.fromNodeId));
     if (!callerModule) return null;
+    const am = /^(.+)\/(\d{1,3})$/.exec(ref.referenceName);
+    if (!am) return null;
     const sameModule = context
-      .getNodesByName(ref.referenceName)
+      .getNodesByName(am[1]!)
       .filter(
         (n) =>
           n.language === 'elixir' &&
@@ -6581,7 +6639,7 @@ function matchReferenceInner(
           n.filePath === ref.filePath &&
           elixirModuleOf(n) === callerModule
       );
-    const chosen = sameModule[0];
+    const chosen = pickElixirArity(sameModule, Number(am[2]));
     if (!chosen) return null;
     return {
       original: ref,

@@ -233,14 +233,14 @@ describe('Resolution Module', () => {
         id: 'function:lib/consumer.ex:config:5',
         kind: 'function',
         name: 'config',
-        qualifiedName: 'MyApp.Consumer::config',
+        qualifiedName: 'MyApp.Consumer::config/1',
         filePath: 'lib/consumer.ex',
       });
       const sameFileHelper = mkNode({
         id: 'function:lib/worker.ex:helper:20',
         kind: 'function',
         name: 'helper',
-        qualifiedName: 'MyApp.Worker::helper',
+        qualifiedName: 'MyApp.Worker::helper/1',
         filePath: 'lib/worker.ex',
       });
       const behaviourModule = mkNode({
@@ -256,7 +256,7 @@ describe('Resolution Module', () => {
         id: 'function:lib/worker.ex:run:3',
         kind: 'function',
         name: 'run',
-        qualifiedName: 'MyApp.Worker::run',
+        qualifiedName: 'MyApp.Worker::run/1',
         filePath: 'lib/worker.ex',
         startLine: 3,
       });
@@ -286,12 +286,12 @@ describe('Resolution Module', () => {
       });
 
       // Bare call to a function that only exists in ANOTHER file: silence.
-      expect(matchReference(mkRef('config', 'calls'), context)).toBeNull();
+      expect(matchReference(mkRef('config/1', 'calls'), context)).toBeNull();
       // Bare call to a same-file function resolves.
-      expect(matchReference(mkRef('helper', 'calls'), context)?.targetNodeId).toBe(sameFileHelper.id);
+      expect(matchReference(mkRef('helper/1', 'calls'), context)?.targetNodeId).toBe(sameFileHelper.id);
       // Bare capture reference follows the same rule.
-      expect(matchReference(mkRef('helper', 'references'), context)?.targetNodeId).toBe(sameFileHelper.id);
-      expect(matchReference(mkRef('config', 'references'), context)).toBeNull();
+      expect(matchReference(mkRef('helper/1', 'references'), context)?.targetNodeId).toBe(sameFileHelper.id);
+      expect(matchReference(mkRef('config/1', 'references'), context)).toBeNull();
       // `@behaviour`/`use` implements refs resolve only to module namespaces;
       // an out-of-repo behaviour stays unresolved.
       expect(matchReference(mkRef('MyBehaviour', 'implements'), context)?.targetNodeId).toBe(behaviourModule.id);
@@ -320,7 +320,7 @@ describe('Resolution Module', () => {
         id: 'function:lib/two_mods.ex:helper:2',
         kind: 'function',
         name: 'helper',
-        qualifiedName: 'Sample.A::helper',
+        qualifiedName: 'Sample.A::helper/0',
         filePath: FILE,
         startLine: 2,
       });
@@ -336,7 +336,7 @@ describe('Resolution Module', () => {
         id: 'function:lib/two_mods.ex:helper:12',
         kind: 'function',
         name: 'helper',
-        qualifiedName: 'Sample.B::helper',
+        qualifiedName: 'Sample.B::helper/0',
         filePath: FILE,
         startLine: 12,
       });
@@ -344,7 +344,7 @@ describe('Resolution Module', () => {
         id: 'function:lib/two_mods.ex:run:14',
         kind: 'function',
         name: 'run',
-        qualifiedName: 'Sample.B::run',
+        qualifiedName: 'Sample.B::run/0',
         filePath: FILE,
         startLine: 14,
       });
@@ -377,7 +377,7 @@ describe('Resolution Module', () => {
 
       const mkRef = (fromNodeId: string) => ({
         fromNodeId,
-        referenceName: 'helper',
+        referenceName: 'helper/0',
         referenceKind: 'calls' as const,
         line: 15,
         column: 4,
@@ -393,7 +393,7 @@ describe('Resolution Module', () => {
         const target = [aModule, aHelper, bModule, bHelper, bRun].find(
           (n) => n.id === result!.targetNodeId
         );
-        expect(target?.qualifiedName).toBe('Sample.B::helper');
+        expect(target?.qualifiedName).toBe('Sample.B::helper/0');
         expect(result!.targetNodeId).toBe(bHelper.id);
       });
 

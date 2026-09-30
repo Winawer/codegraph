@@ -12151,10 +12151,17 @@ init(_) -> {ok, #{}}.
 // =============================================================================
 
 describe('Elixir Extraction', () => {
-  const calls = (r: ReturnType<typeof extractFromSource>): string[] =>
-    r.unresolvedReferences.filter((u) => u.referenceKind === 'calls').map((u) => u.referenceName);
-  const refsOf = (r: ReturnType<typeof extractFromSource>, kind: string): string[] =>
+  // Call/capture refs carry the call-site arity (`Mod::fun/2`, `fun/1`). These
+  // helpers compare arity-less names so a negative check like
+  // `not.toContain('run')` still guards against a `run/1` leak; arity itself
+  // is asserted through `callsWithArity` / `refsWithArity`.
+  const stripArity = (name: string): string => name.replace(/\/\d{1,3}$/, '');
+  const refsWithArity = (r: ReturnType<typeof extractFromSource>, kind: string): string[] =>
     r.unresolvedReferences.filter((u) => u.referenceKind === kind).map((u) => u.referenceName);
+  const callsWithArity = (r: ReturnType<typeof extractFromSource>): string[] => refsWithArity(r, 'calls');
+  const calls = (r: ReturnType<typeof extractFromSource>): string[] => callsWithArity(r).map(stripArity);
+  const refsOf = (r: ReturnType<typeof extractFromSource>, kind: string): string[] =>
+    refsWithArity(r, kind).map(stripArity);
 
   describe('Language detection', () => {
     it('should detect Elixir files', () => {
@@ -12178,7 +12185,7 @@ end
       const ns = result.nodes.find((n) => n.kind === 'namespace');
       expect(ns?.name).toBe('Foo.Bar');
       const greet = result.nodes.find((n) => n.kind === 'function' && n.name === 'greet');
-      expect(greet?.qualifiedName).toBe('Foo.Bar::greet');
+      expect(greet?.qualifiedName).toBe('Foo.Bar::greet/1');
       expect(greet?.language).toBe('elixir');
       expect(greet?.visibility).toBe('public');
       expect(greet?.isExported).toBe(true);
@@ -12187,13 +12194,11 @@ end
       expect(helper?.isExported).toBe(false);
     });
 
-    it('should merge multi-clause functions (incl. default args) into one node', () => {
+    it('should merge multi-clause functions (incl. a default-args head) into one node', () => {
       const code = `defmodule M do
-  def greet(nil), do: "hello"
-  def greet(name) when is_binary(name) do
-    "hello " <> name
-  end
-  def greet(name, greeting \\\\ "hi") do
+  def greet(name, greeting \\\\ "hi")
+  def greet(nil, _greeting), do: "hello"
+  def greet(name, greeting) when is_binary(name) do
     greeting <> " " <> name
   end
 end
@@ -12201,8 +12206,24 @@ end
       const result = extractFromSource('lib/m.ex', code);
       const greets = result.nodes.filter((n) => n.kind === 'function' && n.name === 'greet');
       expect(greets).toHaveLength(1);
+      expect(greets[0]!.qualifiedName).toBe('M::greet/2');
       expect(greets[0]!.startLine).toBe(2);
-      expect(greets[0]!.endLine).toBe(8);
+      expect(greets[0]!.endLine).toBe(6);
+      // The default lets `greet(name)` (arity 1) reach this definition too.
+      expect(greets[0]!.decorators).toEqual(['elixir:min-arity=1']);
+    });
+
+    it('should give each arity its own node', () => {
+      const code = `defmodule M do
+  def greet(name), do: greet(name, "hi")
+  def greet(name, greeting), do: greeting <> " " <> name
+end
+`;
+      const result = extractFromSource('lib/m.ex', code);
+      const greets = result.nodes.filter((n) => n.kind === 'function' && n.name === 'greet');
+      expect(greets.map((n) => n.qualifiedName)).toEqual(['M::greet/1', 'M::greet/2']);
+      expect(greets.map((n) => n.decorators)).toEqual([undefined, undefined]);
+      expect(callsWithArity(result)).toEqual(['greet/2']);
     });
 
     it('should not merge same-named functions across different modules', () => {
@@ -12216,7 +12237,7 @@ end
       const result = extractFromSource('lib/ab.ex', code);
       const runs = result.nodes.filter((n) => n.kind === 'function' && n.name === 'run');
       expect(runs).toHaveLength(2);
-      expect(runs.map((n) => n.qualifiedName).sort()).toEqual(['A::run', 'B::run']);
+      expect(runs.map((n) => n.qualifiedName).sort()).toEqual(['A::run/1', 'B::run/1']);
     });
 
     it('should use @spec as signature and @doc as docstring', () => {
@@ -12260,7 +12281,7 @@ end
       const nested = result.nodes.find((n) => n.kind === 'namespace' && n.name === 'Foo.Bar.Nested');
       expect(nested).toBeDefined();
       const inner = result.nodes.find((n) => n.name === 'inner');
-      expect(inner?.qualifiedName).toBe('Foo.Bar.Nested::inner');
+      expect(inner?.qualifiedName).toBe('Foo.Bar.Nested::inner/1');
     });
 
     it('should still index defs inside a dynamically-named defmodule (no fake namespace)', () => {
@@ -12274,7 +12295,7 @@ end
       // namespace (F6).
       const handle = result.nodes.find((n) => n.kind === 'function' && n.name === 'handle');
       expect(handle).toBeDefined();
-      expect(handle?.qualifiedName).toBe('handle');
+      expect(handle?.qualifiedName).toBe('handle/1');
       // The body call inside the def is still emitted, attributed to the def.
       expect(calls(result)).toContain('Helper::work');
       // No bogus namespace node minted for the un-recoverable dynamic name.
@@ -12290,7 +12311,7 @@ end
       const ns = result.nodes.find((n) => n.kind === 'namespace');
       expect(ns?.name).toBe('Foo.Bar');
       const handle = result.nodes.find((n) => n.kind === 'function' && n.name === 'handle');
-      expect(handle?.qualifiedName).toBe('Foo.Bar::handle');
+      expect(handle?.qualifiedName).toBe('Foo.Bar::handle/1');
       expect(calls(result)).toContain('Helper::work');
     });
 
@@ -12303,7 +12324,7 @@ end
       const ns = result.nodes.find((n) => n.kind === 'namespace');
       expect(ns?.name).toBe('Foo.Bar');
       const handle = result.nodes.find((n) => n.kind === 'function' && n.name === 'handle');
-      expect(handle?.qualifiedName).toBe('Foo.Bar::handle');
+      expect(handle?.qualifiedName).toBe('Foo.Bar::handle/1');
     });
   });
 
@@ -12328,6 +12349,12 @@ end
       expect(c).toContain('Foo.Baz::process');
       expect(c).toContain('Foo.Qux::handle');
       expect(c).toContain('Foo.Alpha::a');
+      expect(callsWithArity(result)).toEqual([
+        'Foo.Sub.Mod::compute/1',
+        'Foo.Baz::process/1',
+        'Foo.Qux::handle/1',
+        'Foo.Alpha::a/1',
+      ]);
     });
 
     it('should emit bare local calls and treat __MODULE__.fun as same-module', () => {
@@ -12362,6 +12389,9 @@ end
       expect(c).toContain('Enum::map');
       expect(c).toContain('MyMod::transform');
       expect(refsOf(result, 'references')).toContain('private_helper');
+      // Piped calls count the piped value; captures carry their literal arity.
+      expect(callsWithArity(result)).toEqual(['Enum::map/2', 'MyMod::transform/1']);
+      expect(refsWithArity(result, 'references')).toEqual(['private_helper/1']);
     });
 
     it('should record a remote capture once, as a reference (no duplicate call edge)', () => {
@@ -12373,7 +12403,7 @@ end
 end
 `;
       const result = extractFromSource('lib/m.ex', code);
-      expect(refsOf(result, 'references')).toContain('Foo.Baz::process');
+      expect(refsWithArity(result, 'references')).toContain('Foo.Baz::process/2');
       expect(calls(result)).not.toContain('Foo.Baz::process');
     });
 
@@ -12398,7 +12428,7 @@ end
       // module level), not from any function.
       const ns = result.nodes.find((n) => n.kind === 'namespace' && n.name === 'M');
       const call = result.unresolvedReferences.find(
-        (u) => u.referenceKind === 'calls' && u.referenceName === 'Product::get_product_name'
+        (u) => u.referenceKind === 'calls' && u.referenceName === 'Product::get_product_name/2'
       );
       expect(call?.fromNodeId).toBe(ns?.id);
     });
@@ -12495,7 +12525,7 @@ end
       const impl = result.nodes.find((n) => n.kind === 'namespace' && n.name === 'Sizeable.List');
       expect(impl).toBeDefined();
       expect(refsOf(result, 'implements')).toContain('Sizeable');
-      const implSize = result.nodes.find((n) => n.qualifiedName === 'Sizeable.List::size');
+      const implSize = result.nodes.find((n) => n.qualifiedName === 'Sizeable.List::size/1');
       expect(implSize).toBeDefined();
       // one-liner do: body still contributes calls
       expect(calls(result)).toContain('length');
@@ -12638,7 +12668,7 @@ end
 `;
       const result = extractFromSource('lib/m.ex', code);
       const run = result.nodes.find((n) => n.kind === 'function' && n.name === 'run');
-      expect(run?.qualifiedName).toBe('M::run');
+      expect(run?.qualifiedName).toBe('M::run/0');
       expect(calls(result)).toContain('Helper::work');
     });
 

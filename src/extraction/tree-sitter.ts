@@ -23,6 +23,7 @@ import type { LanguageExtractor, ExtractorContext } from './tree-sitter-types';
 import { EXTRACTORS } from './languages';
 import { stripCppTemplateArgs, isCppConstructorDeclaration } from './languages/c-cpp';
 import { rustImplTypeName } from './languages/rust';
+import { isElixirOperator } from './languages/elixir';
 import { LiquidExtractor } from './liquid-extractor';
 import { RazorExtractor } from './razor-extractor';
 import { SvelteExtractor } from './svelte-extractor';
@@ -4178,6 +4179,32 @@ export class TreeSitterExtractor {
     return parts.join('.');
   }
 
+  /**
+   * The arity an Elixir call dispatches on: its written arguments (a trailing
+   * keyword list is ONE argument), plus one for a `do … end` block (sugar for a
+   * trailing `do:` keyword) and one when the call is the right operand of `|>`
+   * (the piped value becomes the first argument).
+   */
+  private elixirCallArity(call: SyntaxNode): number {
+    let arity = 0;
+    for (const child of call.namedChildren) {
+      if (child.type === 'arguments') {
+        arity += child.namedChildren.filter((c) => c.type !== 'comment').length;
+      } else if (child.type === 'do_block') {
+        arity += 1;
+      }
+    }
+    const parent = call.parent;
+    if (
+      parent &&
+      getChildByField(parent, 'right')?.startIndex === call.startIndex &&
+      isElixirOperator(parent, '|>', this.source)
+    ) {
+      arity += 1;
+    }
+    return arity;
+  }
+
   /** Look up a keyword value inside an Elixir `arguments` node (`as:` → value). */
   private elixirKeywordValue(argsNode: SyntaxNode, key: string): SyntaxNode | null {
     for (const child of argsNode.namedChildren) {
@@ -4506,11 +4533,14 @@ export class TreeSitterExtractor {
         }
         const target = getChildByField(node, 'target');
         if (!target) return;
+        // Call refs carry the call-site arity (`Mod::fun/2`, `fun/2`), matching
+        // the `/arity` every Elixir function's qualifiedName carries.
+        const arity = this.elixirCallArity(node);
         if (target.type === 'dot') {
           const left = getChildByField(target, 'left');
           const right = getChildByField(target, 'right');
           if (right?.type !== 'identifier') return;
-          const fn = getNodeText(right, this.source);
+          const fn = `${getNodeText(right, this.source)}/${arity}`;
           if (left?.type === 'alias') {
             const fullMod = this.resolveElixirModule(node, getNodeText(left, this.source));
             this.unresolvedReferences.push({
@@ -4541,7 +4571,7 @@ export class TreeSitterExtractor {
           if (ELIXIR_DECL_MACROS.has(name) || ELIXIR_SPECIAL_FORMS.has(name)) return;
           this.unresolvedReferences.push({
             fromNodeId: callerId,
-            referenceName: name,
+            referenceName: `${name}/${arity}`,
             referenceKind: 'calls',
             line,
             column,
@@ -4555,6 +4585,11 @@ export class TreeSitterExtractor {
         const operand = getChildByField(node, 'operand');
         if (operand?.type !== 'binary_operator') return;
         const capLeft = getChildByField(operand, 'left');
+        // The captured arity is the integer after `/`; a non-literal arity has
+        // no static target, so the ref stays arity-less and unresolvable.
+        const capRight = getChildByField(operand, 'right');
+        const capArity =
+          capRight?.type === 'integer' ? `/${getNodeText(capRight, this.source)}` : '';
         if (capLeft?.type === 'call') {
           const t = getChildByField(capLeft, 'target');
           if (t?.type === 'dot') {
@@ -4564,7 +4599,7 @@ export class TreeSitterExtractor {
               const fullMod = this.resolveElixirModule(node, getNodeText(l, this.source));
               this.unresolvedReferences.push({
                 fromNodeId: callerId,
-                referenceName: `${fullMod}::${getNodeText(r, this.source)}`,
+                referenceName: `${fullMod}::${getNodeText(r, this.source)}${capArity}`,
                 referenceKind: 'references',
                 line,
                 column,
@@ -4578,7 +4613,7 @@ export class TreeSitterExtractor {
               // it to the local function (mirrors the `__MODULE__.fun()` call form).
               this.unresolvedReferences.push({
                 fromNodeId: callerId,
-                referenceName: getNodeText(r, this.source),
+                referenceName: `${getNodeText(r, this.source)}${capArity}`,
                 referenceKind: 'references',
                 line,
                 column,
@@ -4588,7 +4623,7 @@ export class TreeSitterExtractor {
         } else if (capLeft?.type === 'identifier') {
           this.unresolvedReferences.push({
             fromNodeId: callerId,
-            referenceName: getNodeText(capLeft, this.source),
+            referenceName: `${getNodeText(capLeft, this.source)}${capArity}`,
             referenceKind: 'references',
             line,
             column,
