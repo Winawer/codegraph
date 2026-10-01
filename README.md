@@ -327,6 +327,7 @@ CodeGraph detects web-framework routing files and emits `route` nodes linked by 
 | **Laravel** | `Route::get()`, `Route::resource()`, `Controller@action`, tuple syntax |
 | **Drupal** | `*.routing.yml` routes (`_controller`, `_form`, entity handlers); `hook_*` implementations in `.module`/`.theme`/`.install`/`.inc` |
 | **Rails** | `get '/x', to: 'users#index'`, hash-rocket `=>` syntax |
+| **Phoenix** | `get`/`post`/…/`match`, `resources` (nested, `only:`/`except:`/`singleton:`), `live`, `forward` inside `scope` paths and aliases → the controller action or LiveView; `pipeline`s and `pipe_through` → the plugs a request runs |
 | **Spring** | `@GetMapping`, `@PostMapping`, `@RequestMapping` on methods |
 | **Play** | `GET`/`POST`/… verb routes in `conf/routes` → `Controller.method` actions (Scala + Java) |
 | **Gin / chi / gorilla / mux** | `r.GET(...)`, `router.HandleFunc(...)` |

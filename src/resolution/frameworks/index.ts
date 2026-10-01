@@ -22,6 +22,7 @@ import { vueResolver, nuxtResolver } from './vue';
 import { astroResolver } from './astro';
 import { djangoResolver, flaskResolver, fastapiResolver } from './python';
 import { railsResolver } from './ruby';
+import { phoenixResolver } from './phoenix';
 import { springResolver } from './java';
 import { playResolver } from './play';
 import { goResolver } from './go';
@@ -70,6 +71,8 @@ const FRAMEWORK_RESOLVERS: FrameworkResolver[] = [
   fastapiResolver,
   // Ruby
   railsResolver,
+  // Elixir — Phoenix router: routes bound to controller actions / LiveViews, pipelines to their plugs
+  phoenixResolver,
   // Java
   springResolver,
   playResolver,

@@ -219,7 +219,7 @@ function collapseWs(text: string): string {
 
 /** Text of a `keyword` key with surrounding space and trailing colon stripped
  * (`do:` → `do`). The grammar can include trailing whitespace on the token. */
-function keywordKey(node: SyntaxNode, source: string): string {
+export function keywordKey(node: SyntaxNode, source: string): string {
   return getNodeText(node, source).trim().replace(/:$/, '');
 }
 
@@ -227,7 +227,7 @@ function keywordKey(node: SyntaxNode, source: string): string {
  * The `arguments` node of a call. In tree-sitter-elixir `arguments` is a child
  * NODE TYPE, not a field, so it must be located by type (not childForFieldName).
  */
-function argsOf(node: SyntaxNode): SyntaxNode | null {
+export function argsOf(node: SyntaxNode): SyntaxNode | null {
   for (const child of node.namedChildren) {
     if (child.type === 'arguments') return child;
   }
@@ -285,7 +285,7 @@ function recoverModuleConcat(head: SyntaxNode, source: string): string | null {
 }
 
 /** Look up a keyword value (`for:` → its value node) inside an arguments node. */
-function keywordValue(argsNode: SyntaxNode | null, key: string, source: string): SyntaxNode | null {
+export function keywordValue(argsNode: SyntaxNode | null, key: string, source: string): SyntaxNode | null {
   if (!argsNode) return null;
   for (const child of argsNode.namedChildren) {
     if (child.type !== 'keywords') continue;
@@ -299,7 +299,7 @@ function keywordValue(argsNode: SyntaxNode | null, key: string, source: string):
 }
 
 /** The `do_block` child of a def/defmodule call, if the block form is used. */
-function doBlockOf(node: SyntaxNode): SyntaxNode | null {
+export function doBlockOf(node: SyntaxNode): SyntaxNode | null {
   for (const child of node.namedChildren) {
     if (child.type === 'do_block') return child;
   }
