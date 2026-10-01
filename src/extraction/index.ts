@@ -1768,10 +1768,14 @@ function resurrectRefFromDroppedEdge(
   const refName = e.metadata?.refName;
   if (typeof refName !== 'string' || refName.length === 0) return null;
   const refKind = typeof e.metadata?.refKind === 'string' ? (e.metadata.refKind as ReferenceKind) : e.kind;
+  const candidates = Array.isArray(e.metadata?.refCandidates)
+    ? (e.metadata.refCandidates as unknown[]).filter((c): c is string => typeof c === 'string')
+    : undefined;
   return {
     fromNodeId: e.source,
     referenceName: refName,
     referenceKind: refKind,
+    ...(candidates?.length ? { candidates } : {}),
     line: e.line ?? 0,
     column: e.column ?? 0,
     filePath: e.sourceFilePath,

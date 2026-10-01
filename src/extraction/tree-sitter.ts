@@ -23,7 +23,7 @@ import type { LanguageExtractor, ExtractorContext } from './tree-sitter-types';
 import { EXTRACTORS } from './languages';
 import { stripCppTemplateArgs, isCppConstructorDeclaration } from './languages/c-cpp';
 import { rustImplTypeName } from './languages/rust';
-import { isElixirOperator } from './languages/elixir';
+import { isElixirOperator, elixirImportFilter } from './languages/elixir';
 import { LiquidExtractor } from './liquid-extractor';
 import { RazorExtractor } from './razor-extractor';
 import { SvelteExtractor } from './svelte-extractor';
@@ -4205,6 +4205,98 @@ export class TreeSitterExtractor {
     return arity;
   }
 
+  // Elixir `import`/`use` directives in lexical scope, memoized per enclosing
+  // module (keyed like elixirAliasMemo).
+  private elixirScopeMemo = new Map<
+    string,
+    Array<{ kind: 'import' | 'use'; module: string; only?: Set<string>; except?: Set<string>; which?: string }>
+  >();
+
+  /**
+   * The `import`s and `use`s in lexical scope at an Elixir call site: those of
+   * the enclosing module and of every module around it, plus file-level ones.
+   * Sibling and nested modules don't contribute, and neither do directives
+   * inside a `quote` (they take effect in whoever injects the quote).
+   */
+  private elixirScope(node: SyntaxNode) {
+    const chain: SyntaxNode[] = [];
+    let root: SyntaxNode = node;
+    for (let n: SyntaxNode | null = node.parent; n; n = n.parent) {
+      root = n;
+      if (n.type !== 'call') continue;
+      const t = getChildByField(n, 'target');
+      const name = t?.type === 'identifier' ? getNodeText(t, this.source) : '';
+      if (name === 'defmodule' || name === 'defprotocol' || name === 'defimpl') chain.push(n);
+    }
+    const key = `${this.filePath}:${chain[0]?.startIndex ?? 'root'}`;
+    const memo = this.elixirScopeMemo.get(key);
+    if (memo) return memo;
+    const out: Array<{ kind: 'import' | 'use'; module: string; only?: Set<string>; except?: Set<string>; which?: string }> = [];
+    const toSet = (list: string | null) => (list === null ? undefined : new Set(list ? list.split(',') : []));
+    const directive = (stmt: SyntaxNode, kind: 'import' | 'use'): void => {
+      const args = stmt.namedChildren.find((c) => c.type === 'arguments') ?? null;
+      const first = args?.namedChildren[0];
+      if (!args || !first) return;
+      let module = '';
+      if (first.type === 'alias') module = this.resolveElixirModule(stmt, getNodeText(first, this.source));
+      else if (getNodeText(first, this.source) === '__MODULE__') module = this.currentElixirModuleName(stmt);
+      if (!module) return;
+      if (kind === 'import') {
+        out.push({
+          kind,
+          module,
+          only: toSet(elixirImportFilter(args, 'only', this.source)),
+          except: toSet(elixirImportFilter(args, 'except', this.source)),
+        });
+      } else {
+        const which = args.namedChildren[1];
+        out.push({
+          kind,
+          module,
+          which: which?.type === 'atom' ? getNodeText(which, this.source).replace(/^:/, '') : undefined,
+        });
+      }
+    };
+    const collect = (n: SyntaxNode): void => {
+      for (const child of n.namedChildren) {
+        if (child.type === 'call') {
+          const t = getChildByField(child, 'target');
+          const name = t?.type === 'identifier' ? getNodeText(t, this.source) : '';
+          if (name === 'defmodule' || name === 'defprotocol' || name === 'defimpl' || name === 'quote') continue;
+          if (name === 'import' || name === 'use') {
+            directive(child, name);
+            continue;
+          }
+        }
+        collect(child);
+      }
+    };
+    for (const mod of chain) collect(mod);
+    collect(root);
+    this.elixirScopeMemo.set(key, out);
+    return out;
+  }
+
+  /**
+   * Scope candidates for a bare Elixir call `name/arity`: `import:Mod` for each
+   * import whose only:/except: lists admit it, `use:Mod` / `use:Mod@which` for
+   * each use. The resolver turns these into the functions they make callable.
+   */
+  private elixirImportCandidates(node: SyntaxNode, name: string, arity: string): string[] | undefined {
+    const out = new Set<string>();
+    const key = `${name}/${arity}`;
+    for (const d of this.elixirScope(node)) {
+      if (d.kind === 'import') {
+        if (d.only && !d.only.has(key)) continue;
+        if (d.except?.has(key)) continue;
+        out.add(`import:${d.module}`);
+      } else {
+        out.add(`use:${d.module}${d.which ? `@${d.which}` : ''}`);
+      }
+    }
+    return out.size > 0 ? [...out] : undefined;
+  }
+
   /** Look up a keyword value inside an Elixir `arguments` node (`as:` → value). */
   private elixirKeywordValue(argsNode: SyntaxNode, key: string): SyntaxNode | null {
     for (const child of argsNode.namedChildren) {
@@ -4575,6 +4667,7 @@ export class TreeSitterExtractor {
             referenceKind: 'calls',
             line,
             column,
+            candidates: this.elixirImportCandidates(node, name, String(arity)),
           });
         }
         return;
@@ -4621,12 +4714,14 @@ export class TreeSitterExtractor {
             }
           }
         } else if (capLeft?.type === 'identifier') {
+          const capName = getNodeText(capLeft, this.source);
           this.unresolvedReferences.push({
             fromNodeId: callerId,
-            referenceName: `${getNodeText(capLeft, this.source)}${capArity}`,
+            referenceName: `${capName}${capArity}`,
             referenceKind: 'references',
             line,
             column,
+            candidates: capArity ? this.elixirImportCandidates(node, capName, capArity.slice(1)) : undefined,
           });
         }
         return;

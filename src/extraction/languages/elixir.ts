@@ -1,6 +1,7 @@
 import type { Node as SyntaxNode } from 'web-tree-sitter';
 import { getNodeText, getChildByField } from '../tree-sitter-helpers';
 import type { LanguageExtractor, ExtractorContext } from '../tree-sitter-types';
+import type { Node } from '../../types';
 
 // Node names follow the elixir-lang/tree-sitter-elixir grammar (ABI 14, the
 // grammar shipped in tree-sitter-wasms). Elixir has no keywords — `defmodule`,
@@ -97,6 +98,105 @@ let lastFnId = '';
  * resolver reads it back so `get(id)` can land on `def get(id, opts \\ [])`.
  */
 export const ELIXIR_MIN_ARITY_PREFIX = 'elixir:min-arity=';
+
+/**
+ * What a `use` injects into its caller, recorded on the provider so the
+ * resolver can follow `use Mod` / `use Mod, :which`:
+ *   - a function defined inside the injected quote carries
+ *     `elixir:injected` (from `__using__`/`using`) or `elixir:injected@which`
+ *     (from the quote `def which` returns — Phoenix's `use AppWeb, :controller`);
+ *   - the provider's namespace node carries `elixir:use-import<tag>=Mod[|only=…|except=…]`,
+ *     `elixir:use-use<tag>=Mod[@which]` and `elixir:use-include<tag>=fun`
+ *     (an `unquote(fun())` splicing another def's quote) for the directives in
+ *     that quote, where `<tag>` is empty or `@which`.
+ */
+export const ELIXIR_INJECTED = 'elixir:injected';
+export const ELIXIR_USE_IMPORT = 'elixir:use-import';
+export const ELIXIR_USE_USE = 'elixir:use-use';
+export const ELIXIR_USE_INCLUDE = 'elixir:use-include';
+
+/** Text of a call's identifier target (`def`, `quote`, `using`), or ''. */
+function callName(node: SyntaxNode, source: string): string {
+  if (node.type !== 'call') return '';
+  const target = getChildByField(node, 'target');
+  return target?.type === 'identifier' ? getNodeText(target, source) : '';
+}
+
+/**
+ * The `use` tag of code inside a quote that a `use` injects: '' for a quote in
+ * `defmacro __using__` or ExUnit.CaseTemplate's `using`, `@which` for a quote in
+ * `def which` (Phoenix's `use AppWeb, :which` convention). Null outside any
+ * quote, or when a module boundary comes first.
+ */
+export function elixirInjectionTag(node: SyntaxNode, source: string): string | null {
+  let inQuote = false;
+  for (let n = node.parent; n; n = n.parent) {
+    const name = callName(n, source);
+    if (!name) continue;
+    if (name === 'defmodule' || name === 'defprotocol' || name === 'defimpl') return null;
+    if (name === 'quote') {
+      inQuote = true;
+      continue;
+    }
+    if (!inQuote) continue;
+    if (name === 'using') return '';
+    if (DEF_MACROS.has(name)) {
+      const fn = defName(n, source)?.name;
+      if (!fn) return null;
+      return fn === '__using__' ? '' : `@${fn}`;
+    }
+  }
+  return null;
+}
+
+/** `only: [a: 1, b: 2]` / `except: […]` → `a/1,b/2`; null when absent or not a literal list. */
+export function elixirImportFilter(args: SyntaxNode | null, key: string, source: string): string | null {
+  const value = keywordValue(args, key, source);
+  if (value?.type !== 'list') return null;
+  const entries: string[] = [];
+  for (const kw of value.namedChildren) {
+    if (kw.type !== 'keywords') continue;
+    for (const pair of kw.namedChildren) {
+      const k = getChildByField(pair, 'key');
+      const v = getChildByField(pair, 'value');
+      if (k && v?.type === 'integer') entries.push(`${keywordKey(k, source)}/${getNodeText(v, source)}`);
+    }
+  }
+  return entries.join(',');
+}
+
+/**
+ * The module a `use`/`import` names: an `alias` literal, or `__MODULE__` /
+ * `unquote(__MODULE__)` (the enclosing module). Null for anything dynamic.
+ */
+function directiveModule(args: SyntaxNode | null, source: string): string | null {
+  const first = args?.namedChildren[0];
+  if (!first) return null;
+  if (first.type === 'alias') return getNodeText(first, source);
+  const text = getNodeText(first, source).replace(/\s+/g, '');
+  if (text === '__MODULE__' || text === 'unquote(__MODULE__)') return currentModulePrefix() || null;
+  return null;
+}
+
+/** The namespace node of the module currently being extracted. */
+function currentNamespace(ctx: ExtractorContext): Node | undefined {
+  for (let i = ctx.nodeStack.length - 1; i >= 0; i--) {
+    const id = ctx.nodeStack[i];
+    for (let j = ctx.nodes.length - 1; j >= 0; j--) {
+      const n = ctx.nodes[j];
+      if (n && n.id === id) {
+        if (n.kind === 'namespace') return n;
+        break;
+      }
+    }
+  }
+  return undefined;
+}
+
+function addDecorator(node: Node, decorator: string): void {
+  if (!node.decorators) node.decorators = [];
+  if (!node.decorators.includes(decorator)) node.decorators.push(decorator);
+}
 
 /** Nesting stack of enclosing module full dotted names (for nested defmodule). */
 let moduleNameStack: string[] = [];
@@ -378,6 +478,12 @@ function handleDefImpl(node: SyntaxNode, ctx: ExtractorContext): boolean {
   const protoAlias = firstAlias(args);
   const forValue = keywordValue(args, 'for', ctx.source);
   const proto = protoAlias ? getNodeText(protoAlias, ctx.source) : '';
+  // `for: unquote(module)` (an impl a macro generates) names no static module:
+  // index the body without inventing a namespace, as for a dynamic defmodule.
+  if (forValue && forValue.type !== 'alias' && forValue.type !== 'list') {
+    visitModuleBody(node, ctx);
+    return true;
+  }
   const forType =
     forValue?.type === 'alias'
       ? getNodeText(forValue, ctx.source)
@@ -453,6 +559,9 @@ function handleDef(node: SyntaxNode, ctx: ExtractorContext, macro: string): bool
     decorators: minArity < arity ? [`${ELIXIR_MIN_ARITY_PREFIX}${minArity}`] : undefined,
   });
   if (!fn) return true;
+  // Defined inside a quote a `use` injects: the function lands in the CALLER.
+  const tag = elixirInjectionTag(node, ctx.source);
+  if (tag !== null) addDecorator(fn, `${ELIXIR_INJECTED}${tag}`);
   ctx.pushScope(fn.id);
   visitDefBodies(node, head, fn.id, ctx);
   ctx.popScope();
@@ -487,9 +596,36 @@ function visitDefBodies(
     if (right) ctx.visitFunctionBody(right, fnId);
   }
   const doBlock = doBlockOf(node);
-  if (doBlock) ctx.visitFunctionBody(doBlock, fnId);
+  if (doBlock) visitBodyStatements(doBlock.namedChildren, fnId, ctx);
   const doValue = keywordValue(argsOf(node), 'do', ctx.source);
-  if (doValue) ctx.visitFunctionBody(doValue, fnId);
+  if (doValue) visitBodyStatements(doValue.type === 'block' ? doValue.namedChildren : [doValue], fnId, ctx);
+}
+
+/**
+ * Walk a def body's statements for calls — except a statement that is a
+ * `quote`, whose contents are code the def returns for a `use` to inject
+ * (`defmacro __using__`, Phoenix's `def controller`): those statements go
+ * through the extractor hook like module-level code, so the `def`s and
+ * `import`/`use` directives in them are seen. The body walker alone treats
+ * them as plain calls.
+ */
+function visitBodyStatements(statements: SyntaxNode[], fnId: string, ctx: ExtractorContext): void {
+  for (const stmt of statements) {
+    if (callName(stmt, ctx.source) !== 'quote') {
+      ctx.visitFunctionBody(stmt, fnId);
+      continue;
+    }
+    const quoteBlock = doBlockOf(stmt);
+    const quoteValue = quoteBlock ? null : keywordValue(argsOf(stmt), 'do', ctx.source);
+    const inner = quoteBlock
+      ? quoteBlock.namedChildren
+      : quoteValue?.type === 'block'
+        ? quoteValue.namedChildren
+        : quoteValue
+          ? [quoteValue]
+          : [];
+    for (const child of inner) ctx.visitNode(child);
+  }
 }
 
 function handleDefstruct(node: SyntaxNode, ctx: ExtractorContext): boolean {
@@ -545,6 +681,26 @@ function handleModuleDirective(node: SyntaxNode, ctx: ExtractorContext, macro: s
   const args = argsOf(node);
   const line = node.startPosition.row + 1;
   const column = node.startPosition.column;
+
+  // Inside a quote a `use` injects, `import`/`use` take effect in the CALLER:
+  // record them on this module for the resolver to follow.
+  const tag = macro === 'import' || macro === 'use' ? elixirInjectionTag(node, ctx.source) : null;
+  const ns = tag !== null ? currentNamespace(ctx) : undefined;
+  if (ns && tag !== null) {
+    const mod = directiveModule(args, ctx.source);
+    if (mod && macro === 'import') {
+      const only = elixirImportFilter(args, 'only', ctx.source);
+      const except = elixirImportFilter(args, 'except', ctx.source);
+      addDecorator(
+        ns,
+        `${ELIXIR_USE_IMPORT}${tag}=${mod}${only !== null ? `|only=${only}` : ''}${except !== null ? `|except=${except}` : ''}`
+      );
+    } else if (mod && macro === 'use') {
+      const which = args?.namedChildren[1];
+      const atom = which?.type === 'atom' ? getNodeText(which, ctx.source).replace(/^:/, '') : '';
+      addDecorator(ns, `${ELIXIR_USE_USE}${tag}=${mod}${atom ? `@${atom}` : ''}`);
+    }
+  }
 
   // `use Mod` injects a contract — model as `implements` (closest existing
   // semantics; resolves to the module namespace via the module-only rule).
@@ -671,6 +827,17 @@ export const elixirExtractor: LanguageExtractor = {
     if (target?.type !== 'identifier') return false; // remote call (dot) → extractCall
 
     const macro = getNodeText(target, ctx.source);
+    if (macro === 'unquote') {
+      // `unquote(shared())` in an injected quote splices the quote another def
+      // of this module returns (Phoenix's `html_helpers()`); record it and let
+      // the call be extracted as usual.
+      const inner = argsOf(node)?.namedChildren[0];
+      const fn = inner && inner.type === 'call' && !argsOf(inner)?.namedChildCount ? callName(inner, ctx.source) : '';
+      const tag = fn ? elixirInjectionTag(node, ctx.source) : null;
+      const ns = tag !== null ? currentNamespace(ctx) : undefined;
+      if (ns) addDecorator(ns, `${ELIXIR_USE_INCLUDE}${tag}=${fn}`);
+      return false;
+    }
     if (macro === 'defmodule' || macro === 'defprotocol') {
       const aliasNode = firstAlias(argsOf(node));
       if (aliasNode) return handleModule(node, ctx, getNodeText(aliasNode, ctx.source));

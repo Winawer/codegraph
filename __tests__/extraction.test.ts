@@ -12532,6 +12532,27 @@ end
     });
   });
 
+  describe('Protocols with a dynamic target', () => {
+    it('should not mint a namespace for defimpl with a non-literal for:', () => {
+      const code = `defmodule Enc do
+  defmacro deriving(module, _struct, _opts) do
+    quote do
+      defimpl Enc.Proto, for: unquote(module) do
+        def encode(x), do: Enc.dump(x)
+      end
+    end
+  end
+end
+`;
+      const result = extractFromSource('lib/enc.ex', code);
+      const namespaces = result.nodes.filter((n) => n.kind === 'namespace').map((n) => n.name);
+      expect(namespaces).toEqual(['Enc']);
+      // The body is still indexed (like a dynamically-named defmodule, F6).
+      expect(result.nodes.find((n) => n.kind === 'function' && n.name === 'encode')).toBeDefined();
+      expect(calls(result)).toContain('Enc::dump');
+    });
+  });
+
   describe('Scripts', () => {
     it('should index .exs script modules', () => {
       const code = `defmodule Mix.Tasks.Hello do

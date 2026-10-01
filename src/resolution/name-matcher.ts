@@ -11,7 +11,13 @@ import { UnresolvedRef, ResolvedRef, ResolutionContext, isSupertypeTarget, CPP_D
 import { blankStringContents, stripCommentsForRegex } from './strip-comments';
 import { JS_BUILT_INS, JS_BUILTIN_METHODS, TS_PRIMITIVE_TYPES } from './js-builtins';
 import { SWIFT_TYPE_PATH_CALL, resolveSwiftTypePathCall } from './swift-type-visibility';
-import { ELIXIR_MIN_ARITY_PREFIX } from '../extraction/languages/elixir';
+import {
+  ELIXIR_MIN_ARITY_PREFIX,
+  ELIXIR_INJECTED,
+  ELIXIR_USE_IMPORT,
+  ELIXIR_USE_USE,
+  ELIXIR_USE_INCLUDE,
+} from '../extraction/languages/elixir';
 /**
  * Ceiling on how many same-named definitions a FUZZY name-match strategy will
  * score. A name defined more times than this is "ubiquitous" — a method/symbol
@@ -6521,6 +6527,95 @@ function elixirModuleOf(node: Node | null | undefined): string | null {
   return sep > 0 ? node.qualifiedName.slice(0, sep) : null;
 }
 
+/** Public, non-injected Elixir function definitions named `name` in `module`. */
+function elixirModuleFunctions(module: string, name: string, context: ResolutionContext): Node[] {
+  return context
+    .getNodesByName(name)
+    .filter(
+      (n) =>
+        n.language === 'elixir' &&
+        n.kind === 'function' &&
+        n.visibility !== 'private' &&
+        elixirModuleOf(n) === module &&
+        !n.decorators?.some((d) => d.startsWith(ELIXIR_INJECTED))
+    );
+}
+
+/** `only=a/1,b/2` / `except=…` filters of a recorded import admit `name/arity`. */
+function elixirFilterAdmits(filters: string[], key: string): boolean {
+  for (const f of filters) {
+    if (f.startsWith('only=') && !f.slice(5).split(',').includes(key)) return false;
+    if (f.startsWith('except=') && f.slice(7).split(',').includes(key)) return false;
+  }
+  return true;
+}
+
+/**
+ * The single function a bare Elixir call `name/arity` reaches through the
+ * `import`/`use` scope extraction recorded on the ref (`import:Mod`,
+ * `use:Mod`, `use:Mod@which`). A `use` is followed through what the provider
+ * recorded for that injected quote — functions defined in it, its own
+ * imports/uses, and quotes it splices in — to a bounded depth. Two or more
+ * distinct targets is ambiguous (the compiler would reject the call), so none.
+ */
+function resolveElixirScopeCall(
+  candidates: string[] | undefined,
+  name: string,
+  arity: number,
+  context: ResolutionContext
+): Node | undefined {
+  if (!candidates?.length) return undefined;
+  const key = `${name}/${arity}`;
+  const found = new Map<string, Node>();
+  const add = (n: Node | undefined) => {
+    if (n) found.set(n.id, n);
+  };
+  const seen = new Set<string>();
+  const expandUse = (module: string, which: string, depth: number): void => {
+    const visitKey = `${module}@${which}`;
+    if (depth > 4 || seen.has(visitKey)) return;
+    seen.add(visitKey);
+    const tag = which ? `@${which}` : '';
+    const ns = context
+      .getNodesByQualifiedName(module)
+      .find((n) => n.language === 'elixir' && n.kind === 'namespace');
+    const injected = context
+      .getNodesByName(name)
+      .filter(
+        (n) =>
+          n.language === 'elixir' &&
+          n.kind === 'function' &&
+          elixirModuleOf(n) === module &&
+          n.decorators?.includes(`${ELIXIR_INJECTED}${tag}`)
+      );
+    add(pickElixirArity(injected, arity));
+    for (const d of ns?.decorators ?? []) {
+      const eq = d.indexOf('=');
+      if (eq < 0) continue;
+      const head = d.slice(0, eq);
+      const value = d.slice(eq + 1);
+      if (head === `${ELIXIR_USE_IMPORT}${tag}`) {
+        const [target, ...filters] = value.split('|');
+        if (target && elixirFilterAdmits(filters, key)) add(pickElixirArity(elixirModuleFunctions(target, name, context), arity));
+      } else if (head === `${ELIXIR_USE_USE}${tag}`) {
+        const [target, nextWhich = ''] = value.split('@');
+        if (target) expandUse(target, nextWhich, depth + 1);
+      } else if (head === `${ELIXIR_USE_INCLUDE}${tag}`) {
+        expandUse(module, value, depth + 1);
+      }
+    }
+  };
+  for (const c of candidates) {
+    if (c.startsWith('import:')) {
+      add(pickElixirArity(elixirModuleFunctions(c.slice(7), name, context), arity));
+    } else if (c.startsWith('use:')) {
+      const [module, which = ''] = c.slice(4).split('@');
+      if (module) expandUse(module, which, 0);
+    }
+  }
+  return found.size === 1 ? [...found.values()][0] : undefined;
+}
+
 /**
  * The Elixir definition a call of `arity` lands on: the definition of exactly
  * that arity (every Elixir function's qualifiedName ends `/N`), else one whose
@@ -6626,27 +6721,36 @@ function matchReferenceInner(
     // candidate → stay unresolved.
     // The ref carries the call-site arity (`helper/2`); pick that arity, or a
     // default-argument definition covering it, never a sibling arity.
-    const callerModule = elixirModuleOf(context.getNodeById?.(ref.fromNodeId));
-    if (!callerModule) return null;
     const am = /^(.+)\/(\d{1,3})$/.exec(ref.referenceName);
     if (!am) return null;
-    const sameModule = context
-      .getNodesByName(am[1]!)
-      .filter(
-        (n) =>
-          n.language === 'elixir' &&
-          n.kind === 'function' &&
-          n.filePath === ref.filePath &&
-          elixirModuleOf(n) === callerModule
-      );
-    const chosen = pickElixirArity(sameModule, Number(am[2]));
-    if (!chosen) return null;
-    return {
-      original: ref,
-      targetNodeId: chosen.id,
-      confidence: 0.9,
-      resolvedBy: 'exact-match',
-    };
+    const [, name, arityText] = am as unknown as [string, string, string];
+    const arity = Number(arityText);
+    const callerModule = elixirModuleOf(context.getNodeById?.(ref.fromNodeId));
+    if (callerModule) {
+      const sameModule = context
+        .getNodesByName(name)
+        .filter(
+          (n) =>
+            n.language === 'elixir' &&
+            n.kind === 'function' &&
+            n.filePath === ref.filePath &&
+            elixirModuleOf(n) === callerModule
+        );
+      const chosen = pickElixirArity(sameModule, arity);
+      if (chosen) {
+        return {
+          original: ref,
+          targetNodeId: chosen.id,
+          confidence: 0.9,
+          resolvedBy: 'exact-match',
+        };
+      }
+    }
+    // Not the caller's own function: the other legitimate target is one an
+    // `import` or `use` put in scope (the scope candidates extraction attached).
+    const imported = resolveElixirScopeCall(ref.candidates, name, arity, context);
+    if (!imported) return null;
+    return { original: ref, targetNodeId: imported.id, confidence: 0.8, resolvedBy: 'import' };
   }
 
   // Elixir `@behaviour Mod` / `use Mod` implements refs also target a MODULE
