@@ -14,6 +14,15 @@
  *   the router's own scope, a module plug's `call/2`), and a route `calls` the
  *   pipelines and plugs its scopes `pipe_through`.
  *
+ * - a LiveView route is a page a user is ON, so it is named by its path alone
+ *   (`/dashboard`), as client routers name a screen; a controller route keeps
+ *   its method (`GET /users`), as every server framework's endpoints do;
+ * - `redirect(conn, to: ~p"/x")`, `push_navigate(socket, to: …)` and
+ *   `push_patch(socket, to: …)` with a literal `~p` or string destination get
+ *   a `navigates` edge to the route that serves it (interpolations match a
+ *   `:param`; a computed or external destination, or a path no route serves,
+ *   stays unresolved).
+ *
  * The router is parsed with the Elixir grammar rather than scanned with
  * regexes, so `do:` keyword bodies, strings and comments cannot unbalance a
  * scope. A call the router does not define (an app's own `on_ee do … end`, an
@@ -27,7 +36,8 @@ import { Node } from '../../types';
 import { FrameworkResolver, UnresolvedRef, ResolvedRef, ResolutionContext } from '../types';
 import { getParser } from '../../extraction/grammars';
 import { getNodeText, getChildByField } from '../../extraction/tree-sitter-helpers';
-import { argsOf, doBlockOf, keywordValue } from '../../extraction/languages/elixir';
+import { argsOf, doBlockOf, keywordValue, ELIXIR_NAV_CANDIDATE } from '../../extraction/languages/elixir';
+import { HOLE, matchRoute, type RouteTable } from './expo-router';
 
 const HTTP_VERBS = new Set(['get', 'post', 'put', 'patch', 'delete', 'options', 'head', 'connect', 'trace']);
 
@@ -52,7 +62,12 @@ interface Scope {
    * iteration, or null when the list is computed (no static value).
    */
   vars: Map<string, string | null>;
+  /** A `host:` the scope restricts its routes to (`"preview."`), or '' for any host. */
+  host: string;
 }
+
+/** Decorator a route in a `host:` scope carries — it answers requests to that host only. */
+const HOST_DECORATOR = 'phoenix:host=';
 
 function callName(node: SyntaxNode, source: string): string {
   if (node.type !== 'call') return '';
@@ -172,14 +187,14 @@ function extractRouter(
     return null;
   };
 
-  const addRoute = (at: SyntaxNode, method: string, path: string, handler: string, scope: Scope): void => {
+  const addRoute = (at: SyntaxNode, method: string, path: string, handler: string, scope: Scope, screen = false): void => {
     const line = at.startPosition.row + 1;
     const id = `route:${filePath}:${line}:${method}:${path}`;
     if (nodes.some((n) => n.id === id)) return;
     nodes.push({
       id,
       kind: 'route',
-      name: `${method} ${path}`,
+      name: screen ? path : `${method} ${path}`,
       qualifiedName: `${filePath}::route:${method}:${path}`,
       filePath,
       startLine: line,
@@ -187,6 +202,7 @@ function extractRouter(
       startColumn: at.startPosition.column,
       endColumn: at.endPosition.column,
       language: 'elixir',
+      ...(scope.host ? { decorators: [`${HOST_DECORATOR}${scope.host}`] } : {}),
       updatedAt: now,
     });
     ref(id, handler, 'references', at);
@@ -278,7 +294,7 @@ function extractRouter(
         const path = stringValue(pathNode, source, scope.vars);
         if (path === null || modNode?.type !== 'alias') continue;
         const live = joinAlias(scope.alias, getNodeText(modNode, source));
-        addRoute(stmt, 'GET', joinPath(scope.path, path), `${live}::mount/3`, scope);
+        addRoute(stmt, 'GET', joinPath(scope.path, path), `${live}::mount/3`, scope, true);
       } else if (name === 'forward') {
         const [pathNode, plugNode] = pos;
         const path = stringValue(pathNode, source, scope.vars);
@@ -318,6 +334,7 @@ function extractRouter(
         if (unknowable) continue;
         const kwPath = stringValue(keywordValue(args, 'path', source), source);
         if (kwPath !== null) path = kwPath;
+        const host = stringValue(keywordValue(args, 'host', source), source, scope.vars) ?? scope.host;
         const kwAlias = keywordValue(args, 'alias', source);
         if (kwAlias?.type === 'alias') alias = getNodeText(kwAlias, source);
         else if (kwAlias && getNodeText(kwAlias, source) === 'false') aliasOff = true;
@@ -328,6 +345,7 @@ function extractRouter(
             alias: aliasOff ? '' : joinAlias(scope.alias, alias),
             pipes: [...scope.pipes],
             vars: scope.vars,
+            host,
           });
         }
       } else if (name === 'defmodule' || name === 'def' || name === 'defp' || name === 'defmacro' || name === 'defmacrop') {
@@ -367,7 +385,89 @@ function extractRouter(
     }
   };
 
-  walk(body, { path: '', alias: '', pipes: [], vars: new Map() });
+  walk(body, { path: '', alias: '', pipes: [], vars: new Map(), host: '' });
+}
+
+// =============================================================================
+// Navigation: redirect / push_navigate / push_patch → the route they name
+// =============================================================================
+
+const NAV_REF = /^(?:[A-Z][\w.]*::)?(redirect|push_navigate|push_patch)\/\d+$/;
+
+/** Segments to match from a recorded destination: literal, or `*` where `#{…}` sits; query and fragment dropped. */
+function destinationSegs(display: string): string[] {
+  const path = display.replace(/#\{…\}/g, HOLE).split(/[?#]/)[0]!;
+  return path
+    .split('/')
+    .filter((seg) => seg.length > 0)
+    .map((seg) => (seg.includes(HOLE) ? '*' : seg));
+}
+
+/** The app a file belongs to: an umbrella app's directory, or the project. */
+function appOf(filePath: string): string {
+  return /^apps\/[^/]+\//.exec(filePath)?.[0] ?? '';
+}
+
+/**
+ * Per-app tables of the routes a browser can be sent to: LiveView routes and
+ * controller `GET` routes, keyed by path. When routes share a path (the same
+ * address served on several hosts), the one without a `host:` restriction is
+ * the address a redirect from the app means; with none, or several, the path
+ * is ambiguous and left out — ambiguity is a null.
+ */
+const navTables = new Map<string, { source: readonly Node[]; byApp: Map<string, RouteTable> }>();
+
+function navTable(context: ResolutionContext, app: string): RouteTable | undefined {
+  const all = context.getNodesByKind('route');
+  const key = context.getProjectRoot();
+  let cached = navTables.get(key);
+  if (!cached || cached.source !== all) {
+    const byPath = new Map<string, Map<string, Node[]>>();
+    for (const node of all) {
+      if (node.language !== 'elixir' || !node.qualifiedName.includes('::route:')) continue;
+      const path = node.name.startsWith('/') ? node.name : node.name.startsWith('GET /') ? node.name.slice(4) : null;
+      if (path === null) continue;
+      const paths = byPath.get(appOf(node.filePath)) ?? byPath.set(appOf(node.filePath), new Map()).get(appOf(node.filePath))!;
+      paths.set(path, [...(paths.get(path) ?? []), node]);
+    }
+    const byApp = new Map<string, RouteTable>();
+    for (const [nodeApp, paths] of byPath) {
+      const table: RouteTable = { source: all, exact: new Map(), dynamic: [] };
+      for (const [path, routes] of paths) {
+        const anyHost = routes.filter((r) => !r.decorators?.some((d) => d.startsWith(HOST_DECORATOR)));
+        const node = routes.length === 1 ? routes[0] : anyHost.length === 1 ? anyHost[0] : undefined;
+        if (!node) continue;
+        table.exact.set(path, node);
+        // Phoenix's glob `*rest` is the catch-all every matcher spells `:rest*`.
+        const segs = path.split('/').slice(1).filter(Boolean).map((seg) => (seg.startsWith('*') ? `:${seg.slice(1)}*` : seg));
+        if (segs.some((seg) => seg.startsWith(':'))) table.dynamic.push({ node, segs });
+      }
+      byApp.set(nodeApp, table);
+    }
+    cached = { source: all, byApp };
+    navTables.set(key, cached);
+  }
+  return cached.byApp.get(app);
+}
+
+function resolveNavigation(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
+  const nav = NAV_REF.exec(ref.referenceName);
+  if (!nav) return null;
+  // The literal destination extraction recorded on the reference.
+  const display = ref.candidates?.find((c) => c.startsWith(ELIXIR_NAV_CANDIDATE))?.slice(ELIXIR_NAV_CANDIDATE.length);
+  if (!display) return null;
+  const table = navTable(context, appOf(ref.filePath));
+  if (!table) return null;
+  const target = matchRoute(destinationSegs(display), table);
+  if (!target) return null;
+  return {
+    original: ref,
+    targetNodeId: target.id,
+    confidence: 0.95,
+    resolvedBy: 'framework',
+    edgeKind: 'navigates',
+    metadata: { href: display, navMethod: nav[1] },
+  };
 }
 
 export const phoenixResolver: FrameworkResolver = {
@@ -387,10 +487,17 @@ export const phoenixResolver: FrameworkResolver = {
     return false;
   },
 
+  claimsReference(name: string): boolean {
+    // `redirect` / `push_navigate` are Phoenix's own functions, never indexed.
+    return NAV_REF.test(name);
+  },
+
   resolve(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
+    if (ref.language !== 'elixir') return null;
+    if (ref.referenceKind === 'calls' && !ref.fromNodeId.startsWith('route:')) return resolveNavigation(ref, context);
     // A LiveView route's handler: `mount/3`, or `render/1` for a LiveView
     // that has no mount. Everything else rides the Elixir resolution rules.
-    if (!ref.fromNodeId.startsWith('route:') || ref.language !== 'elixir') return null;
+    if (!ref.fromNodeId.startsWith('route:')) return null;
     const live = /^(.+)::mount\/3$/.exec(ref.referenceName);
     if (!live) return null;
     for (const name of [`${live[1]}::mount/3`, `${live[1]}::render/1`]) {

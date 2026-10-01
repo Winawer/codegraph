@@ -149,6 +149,37 @@ export function elixirInjectionTag(node: SyntaxNode, source: string): string | n
   return null;
 }
 
+/** The calls whose `to:` keyword names where a Phoenix app sends the user. */
+export const ELIXIR_NAV_CALLS = new Set(['redirect', 'push_navigate', 'push_patch']);
+/** Scope-candidate prefix carrying a navigation call's literal destination. */
+export const ELIXIR_NAV_CANDIDATE = 'nav:';
+
+/**
+ * A navigation call's literal `to:` destination — `~p"/users/#{id}"` or
+ * `"/users"` — as written, with `#{…}` for each interpolation. Null for a
+ * computed destination, an `external:` one, or anything not starting with `/`.
+ *
+ * Read here, at extraction, because resolution runs where no grammar is
+ * loaded (files are parsed on worker threads): the resolver gets the
+ * destination from the reference, never by re-parsing the file.
+ */
+export function elixirNavDestination(call: SyntaxNode, source: string): string | null {
+  const value = keywordValue(argsOf(call), 'to', source);
+  if (!value) return null;
+  if (value.type === 'sigil') {
+    const name = value.namedChildren.find((c) => c.type === 'sigil_name');
+    if (!name || getNodeText(name, source) !== 'p') return null;
+  } else if (value.type !== 'string') {
+    return null;
+  }
+  let out = '';
+  for (const part of value.namedChildren) {
+    if (part.type === 'quoted_content' || part.type === 'escape_sequence') out += getNodeText(part, source);
+    else if (part.type === 'interpolation') out += '#{…}';
+  }
+  return out.startsWith('/') ? out : null;
+}
+
 /** `only: [a: 1, b: 2]` / `except: […]` → `a/1,b/2`; null when absent or not a literal list. */
 export function elixirImportFilter(args: SyntaxNode | null, key: string, source: string): string | null {
   const value = keywordValue(args, key, source);

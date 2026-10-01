@@ -30,7 +30,7 @@ to write. That is why "add a router" is a small, self-contained job.
 
 ## Routers — routes AND navigation (done)
 
-Seven. Each reads a literal destination and leaves a computed one, a path no
+Eight. Each reads a literal destination and leaves a computed one, a path no
 route serves, and a conditional whose arms disagree unresolved rather than
 guessed.
 
@@ -43,8 +43,16 @@ guessed.
 | Vue Router / Nuxt | `frameworks/vue-router.ts` (Nuxt file routes: `nuxtResolver` in `frameworks/vue.ts`) | `vue-router-synthesizer.ts` | `vue-router.test.ts` | vue-realworld (23 edges); vue-element-admin (62 routes), vue-admin-template (14), vben (192), halo console (34) — named tables, module files, `children` + layouts; Nuxt: mealie, elk, nuxt/movies |
 | SvelteKit | `frameworks/sveltekit-router.ts` | `sveltekit-synthesizer.ts` | `sveltekit-router.test.ts`, `sveltekit-route-names.test.ts` | sveltekit-realworld (31 edges); shadcn-svelte and skeleton (`(group)` layouts: 13 and 23 edges), svelte.dev (74), kit's test apps (47) |
 | Angular | `frameworks/angular-router.ts` | `angular-template-synthesizer.ts` | `angular-router.test.ts` | angular-realworld (31 edges, 18 renders), Ghostfolio (189 edges, 170 renders), ngx-admin (routes and renders; its menus are config), angular-spotify (Nx libs behind barrels: 14 routes), jira-clone (class-constant paths, mount-only redirects), jhipster (60), ionic-conference (18), Angular-JumpStart (18) |
+| Phoenix (Elixir) | `frameworks/phoenix.ts` (router parsed with the Elixir grammar; destinations read at extraction — `redirect`/`push_navigate`/`push_patch` `to: ~p"…"` recorded on the call's reference) | — (`.heex` templates are not indexed, so `<.link navigate>` is not read) | `phoenix-router.test.ts` | plausible/analytics (240 routes, 146 edges), hexpm (319 routes, 152 edges): every literal destination resolved, every edge's path checked against its route |
 
-Shared machinery all seven use, in `frameworks/expo-router.ts`: `RouteTable` /
+Phoenix adds one trap of its own: **resolution runs where no grammar is
+loaded** — files are parsed on worker threads, and the resolver runs on the
+main thread — so a resolver must never re-parse a file. Read what it needs at
+extraction and carry it on the reference (Phoenix records a navigation's
+literal `to:` as a `nav:` candidate). Tests extract in-process, so only an
+index through the built CLI catches this.
+
+Shared machinery all eight use, in `frameworks/expo-router.ts`: `RouteTable` /
 `RootedRouteTable`, `routesForFile`, `addRouteTo`, `matchRoute`, `appRootFor`,
 `parseHrefExpression`, `readHrefViaLocal`, `nthArgumentText`, `readStringAt`,
 `toHref`. Plus `pageForHref` in `frameworks/nextjs.ts` (framework-agnostic
@@ -88,9 +96,12 @@ table; the resolver half is one `Astro.redirect` reader.
 
 ### 2. Server-rendered frameworks — a redirect is a transition, not just a response
 
-**Fifteen frameworks** have route nodes and no navigation: Django, Flask,
-FastAPI, Express, NestJS, Laravel, Drupal, Rails, Phoenix, Spring, Play,
-Gin/chi/gorilla, Axum/actix/Rocket, ASP.NET, Vapor.
+**Fourteen frameworks** have route nodes and no navigation: Django, Flask,
+FastAPI, Express, NestJS, Laravel, Drupal, Rails, Spring, Play, Gin/chi/gorilla,
+Axum/actix/Rocket, ASP.NET, Vapor. (Phoenix, the one server framework with
+navigation, names a LiveView route by its path — it is a page — and keeps the
+method on controller routes, which are endpoints; a redirect to either is a
+`navigates` edge.)
 
 Be precise about what is missing. `redirect_to`, `HttpResponseRedirect`,
 `res.redirect`, PHP's `redirect()` are **already recognised as `response`
@@ -105,7 +116,6 @@ gets no Screens picture at all today:
 | Framework | The destination to read | Why it is harder than a client router |
 |---|---|---|
 | Rails | `redirect_to :dashboard`, `redirect_to users_path` | destinations are named helpers (`*_path`/`*_url`) generated from `routes.rb`, not literals |
-| Phoenix | `redirect(conn, to: ~p"/x")`, `push_navigate(socket, to: ~p"/x")`, `push_patch` | the `~p` sigil is a literal path checked against the router, so this is closer to a client router than Rails is; a LiveView's `<.link navigate={~p"/x"}>` lives in `.heex` templates, which are not indexed |
 | Django | `redirect('profile')`, `reverse('profile')` | same — a route *name*, like Vue's `{ name }`, which `vue-router.ts` already shows how to index |
 | Laravel | `redirect()->route('home')`, `->view()` | route names again |
 | Spring | `"redirect:/x"`, `RedirectView` | a literal inside a string return value |

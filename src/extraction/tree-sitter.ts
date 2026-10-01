@@ -23,7 +23,13 @@ import type { LanguageExtractor, ExtractorContext } from './tree-sitter-types';
 import { EXTRACTORS } from './languages';
 import { stripCppTemplateArgs, isCppConstructorDeclaration } from './languages/c-cpp';
 import { rustImplTypeName } from './languages/rust';
-import { isElixirOperator, elixirImportFilter } from './languages/elixir';
+import {
+  isElixirOperator,
+  elixirImportFilter,
+  elixirNavDestination,
+  ELIXIR_NAV_CALLS,
+  ELIXIR_NAV_CANDIDATE,
+} from './languages/elixir';
 import { LiquidExtractor } from './liquid-extractor';
 import { RazorExtractor } from './razor-extractor';
 import { SvelteExtractor } from './svelte-extractor';
@@ -4297,6 +4303,17 @@ export class TreeSitterExtractor {
     return out.size > 0 ? [...out] : undefined;
   }
 
+  /**
+   * A navigation call's (`redirect`, `push_navigate`, `push_patch`) literal
+   * destination as a `nav:` candidate, added to whatever scope it already has.
+   */
+  private elixirWithNav(call: SyntaxNode, fn: string, candidates: string[] | undefined): string[] | undefined {
+    if (!ELIXIR_NAV_CALLS.has(fn)) return candidates;
+    const dest = elixirNavDestination(call, this.source);
+    if (dest === null) return candidates;
+    return [...(candidates ?? []), `${ELIXIR_NAV_CANDIDATE}${dest}`];
+  }
+
   /** Look up a keyword value inside an Elixir `arguments` node (`as:` → value). */
   private elixirKeywordValue(argsNode: SyntaxNode, key: string): SyntaxNode | null {
     for (const child of argsNode.namedChildren) {
@@ -4635,12 +4652,14 @@ export class TreeSitterExtractor {
           const fn = `${getNodeText(right, this.source)}/${arity}`;
           if (left?.type === 'alias') {
             const fullMod = this.resolveElixirModule(node, getNodeText(left, this.source));
+            const navCandidates = this.elixirWithNav(node, getNodeText(right, this.source), undefined);
             this.unresolvedReferences.push({
               fromNodeId: callerId,
               referenceName: `${fullMod}::${fn}`,
               referenceKind: 'calls',
               line,
               column,
+              ...(navCandidates ? { candidates: navCandidates } : {}),
             });
           } else if (left?.type === 'identifier' && getNodeText(left, this.source) === '__MODULE__') {
             // `__MODULE__.fun(...)` targets THIS module — bare name, same-file
@@ -4667,7 +4686,7 @@ export class TreeSitterExtractor {
             referenceKind: 'calls',
             line,
             column,
-            candidates: this.elixirImportCandidates(node, name, String(arity)),
+            candidates: this.elixirWithNav(node, name, this.elixirImportCandidates(node, name, String(arity))),
           });
         }
         return;

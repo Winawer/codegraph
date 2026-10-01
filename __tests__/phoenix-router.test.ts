@@ -8,6 +8,11 @@
  * compiles to a function `browser/2` on the router, so it is indexed as one:
  * a route `calls` the pipelines its scope pipes through, and a pipeline
  * `calls` each plug it runs.
+ *
+ * A LiveView route is a page a user is ON, so it is named by its path alone
+ * (`/dashboard`), as every client router names a screen. Code that sends the
+ * user to a route — `redirect(conn, to: ~p"/x")`, `push_navigate`,
+ * `push_patch` — gets a `navigates` edge to the route it names.
  */
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import * as fs from 'node:fs';
@@ -43,6 +48,11 @@ const ROUTER = `defmodule AppWeb.Router do
       live "/dashboard", DashboardLive, :index, as: :dash
       live "/static", StaticLive
     end
+  end
+
+  # The same address on another host: requests to admin.* only.
+  scope "/", AppWeb, host: "admin." do
+    get "/", PageController, :home
   end
 
   scope "/admin", AppWeb.Admin, as: :admin do
@@ -123,8 +133,17 @@ end
 defmodule AppWeb.UserController do
   def index(conn, _params), do: conn
   def show(conn, _params), do: conn
-  def update(conn, _params), do: conn
-  def delete(conn, _params), do: conn
+
+  def update(conn, %{"id" => id}) do
+    conn
+    |> put_flash(:info, "Saved")
+    |> redirect(to: ~p"/users/#{id}?tab=profile")
+  end
+
+  def delete(conn, _params), do: redirect(conn, to: "/")
+  def away(conn), do: redirect(conn, external: "https://example.com")
+  def computed(conn, path), do: redirect(conn, to: path)
+  def nowhere(conn), do: redirect(conn, to: ~p"/no/such/page")
 end
 
 defmodule AppWeb.PostController do
@@ -158,6 +177,10 @@ end
   'lib/app_web/live.ex': `defmodule AppWeb.DashboardLive do
   def mount(_params, _session, socket), do: {:ok, socket}
   def render(assigns), do: assigns
+
+  def handle_event("open", _params, socket), do: {:noreply, push_navigate(socket, to: ~p"/static")}
+  def handle_event("page", _params, socket), do: {:noreply, push_patch(socket, to: ~p"/dashboard?page=2")}
+  def handle_info(:docs, socket), do: {:noreply, redirect(socket, to: ~p"/v2/files/docs")}
 end
 
 defmodule AppWeb.StaticLive do
@@ -176,6 +199,7 @@ describe('Phoenix router', () => {
   let dir: string;
   let routes: string[];
   let edges: Edge[];
+  let navigates: Array<{ from: string; to: string; href: string; navMethod: string; toLine?: number }>;
 
   beforeAll(async () => {
     dir = fs.mkdtempSync(path.join(os.tmpdir(), 'phoenix-router-'));
@@ -200,6 +224,15 @@ describe('Phoenix router', () => {
            AND (s.kind = 'route' OR s.qualified_name LIKE 'AppWeb.Router::%')`
       )
       .all();
+    navigates = db
+      .prepare(
+        `SELECT s.qualified_name "from", t.name "to",
+                json_extract(e.metadata, '$.href') href, json_extract(e.metadata, '$.navMethod') navMethod,
+                t.start_line toLine
+         FROM edges e JOIN nodes s ON s.id = e.source JOIN nodes t ON t.id = e.target
+         WHERE e.kind = 'navigates' ORDER BY s.qualified_name, t.name`
+      )
+      .all();
     cg.destroy();
   });
 
@@ -218,13 +251,14 @@ describe('Phoenix router', () => {
         '* /api/echo',
         '* /api/legacy/*',
         'GET /',
+        'GET /',
         'GET /account',
         'GET /docs',
         'GET /spec',
-        'GET /dashboard',
+        '/dashboard',
         'GET /ee/billing',
         'GET /health',
-        'GET /static',
+        '/static',
         'GET /users',
         'GET /users/:id',
         'GET /users/:user_id/posts',
@@ -240,7 +274,7 @@ describe('Phoenix router', () => {
   });
 
   it('binds controller routes to the action, through scope aliases', () => {
-    expect(handlerOf('GET /')).toEqual(['AppWeb.PageController::home/2']);
+    expect(handlerOf('GET /')).toEqual(['AppWeb.PageController::home/2', 'AppWeb.PageController::home/2']);
     expect(handlerOf('GET /users/:id')).toEqual(['AppWeb.UserController::show/2']);
     expect(handlerOf('PUT /users/:id')).toEqual(['AppWeb.UserController::update/2']);
     expect(handlerOf('GET /users/:user_id/posts')).toEqual(['AppWeb.PostController::index/2']);
@@ -252,8 +286,8 @@ describe('Phoenix router', () => {
   });
 
   it('binds LiveView routes to mount/3, or render/1 when there is no mount', () => {
-    expect(handlerOf('GET /dashboard')).toEqual(['AppWeb.DashboardLive::mount/3']);
-    expect(handlerOf('GET /static')).toEqual(['AppWeb.StaticLive::render/1']);
+    expect(handlerOf('/dashboard')).toEqual(['AppWeb.DashboardLive::mount/3']);
+    expect(handlerOf('/static')).toEqual(['AppWeb.StaticLive::render/1']);
   });
 
   it('binds a forward, and a route to a plug, to that plug', () => {
@@ -284,6 +318,21 @@ describe('Phoenix router', () => {
       'AppWeb.Plugs.EeOnly::call/2',
       'AppWeb.Plugs.Locale::call/2',
       'AppWeb.UserAuth::fetch_current_user/2',
+    ]);
+  });
+
+  it('sends a redirect to the route without a host: restriction when an address is shared', () => {
+    const mainRoot = navigates.find((n) => n.from === 'AppWeb.UserController::delete/2');
+    expect(mainRoot?.toLine).toBe(ROUTER.split('\n').findIndex((l) => l.includes('get "/", PageController, :home')) + 1);
+  });
+
+  it('links redirects and LiveView navigation to the route they name', () => {
+    expect(navigates.map(({ toLine: _line, ...rest }) => rest)).toEqual([
+      { from: 'AppWeb.DashboardLive::handle_event/3', to: '/dashboard', href: '/dashboard?page=2', navMethod: 'push_patch' },
+      { from: 'AppWeb.DashboardLive::handle_event/3', to: '/static', href: '/static', navMethod: 'push_navigate' },
+      { from: 'AppWeb.DashboardLive::handle_info/2', to: 'GET /v2/files/docs', href: '/v2/files/docs', navMethod: 'redirect' },
+      { from: 'AppWeb.UserController::delete/2', to: 'GET /', href: '/', navMethod: 'redirect' },
+      { from: 'AppWeb.UserController::update/2', to: 'GET /users/:id', href: '/users/#{…}?tab=profile', navMethod: 'redirect' },
     ]);
   });
 });
